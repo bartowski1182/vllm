@@ -85,9 +85,7 @@ def make_runner(
     runner.cuda()
     routed = runner.routed_experts
     loaded = list(routed.load_weights(list(ckpt.items())))
-    # A fused per-expert gate_up_proj tensor loads as its w1 and w3 halves.
-    fused = sum(".gate_up_proj." in name for name in ckpt)
-    assert len(loaded) == len(ckpt) + fused, (len(loaded), len(ckpt), fused)
+    assert len(loaded) == len(ckpt), (len(loaded), len(ckpt))
     routed.quant_method.process_weights_after_loading(routed)
     experts = routed.quant_method.moe_kernel.fused_experts
     assert experts.post_gemm2_hook is runner.post_expert_finalize

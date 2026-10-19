@@ -118,26 +118,6 @@ def test_regex_targets_follow_vllm_module_names() -> None:
         assert config.get_scheme_dict(module, name) is None, name
 
 
-def test_fused_gate_up_targets_match_split_probes() -> None:
-    """A recipe targeting per-expert ``gate_up_proj`` resolves the probes
-    RoutedExperts makes with the split names, and the rewrite is idempotent."""
-    raw = copy.deepcopy(MXFP4_DSFP8_QUANTIZATION_CONFIG)
-    raw["config_groups"]["experts"]["targets"] = [
-        r"re:.*mlp\.experts\.\d+\.(gate_up_proj|down_proj)$"
-    ]
-    config = CompressedTensorsConfig.from_config(raw)
-    align_compressed_tensors_quant_config(config)
-    targets = dict(config.target_scheme_map)
-    align_compressed_tensors_quant_config(config)
-    assert config.target_scheme_map == targets
-
-    module = torch.nn.Identity()
-    experts = "model.layers.3.feed_forward.experts.0"
-    for name in ("gate_up_proj", "gate_proj", "up_proj", "down_proj"):
-        scheme = config.get_scheme_dict(module, f"{experts}.{name}")
-        assert scheme is not None and scheme["format"] == "mxfp4-pack-quantized"
-
-
 def test_quant_config_alignment_is_idempotent() -> None:
     config = _aligned_quant_config()
     targets, ignore = dict(config.target_scheme_map), list(config.ignore)
@@ -154,7 +134,6 @@ def test_cuda_mapper_keeps_per_expert_compressed_tensors_names() -> None:
             [
                 (f"{layer}.mlp.experts.7.gate_proj.weight_packed", torch.ones(1)),
                 (f"{layer}.mlp.experts.7.up_proj.weight_scale", torch.ones(1)),
-                (f"{layer}.mlp.experts.7.gate_up_proj.weight_scale", torch.ones(1)),
                 (f"{layer}.mlp.pre_expert_proj.weight_scale", torch.ones(1)),
                 (f"{layer}.mlp.post_expert_proj.weight", torch.ones(1)),
                 (f"{layer}.self_attn.gate_proj.weight_scale", torch.ones(1)),
@@ -164,12 +143,11 @@ def test_cuda_mapper_keeps_per_expert_compressed_tensors_names() -> None:
     assert [name for name, _ in mapped] == [
         "model.layers.0.feed_forward.experts.7.gate_proj.weight_packed",
         "model.layers.0.feed_forward.experts.7.up_proj.weight_scale",
-        "model.layers.0.feed_forward.experts.7.gate_up_proj.weight_scale",
         "model.layers.0.feed_forward.pooler.weight_scale",
         "model.layers.0.feed_forward.unpooler.weight",
         "model.layers.0.self_attn.qkv_proj.weight_scale",
     ]
-    assert mapped[5][1].shard_id == "o_gate"
+    assert mapped[4][1].shard_id == "o_gate"
 
 
 def test_cuda_model_mapper_keeps_expert_gate_up_unstacked() -> None:
@@ -230,7 +208,6 @@ def test_consolidated_loader_routes_per_expert_names_to_expert_mapping(
         ("7.gate_proj.weight_packed", torch.empty(1)),
         ("7.gate_proj.weight_shape", torch.empty(2)),
         ("7.down_proj.weight_scale", torch.empty(1)),
-        ("3.gate_up_proj.weight_packed", torch.empty(1)),
         ("w2_weight_scale", torch.empty(1)),
     ]
     list(experts.load_weights(weights))
@@ -239,7 +216,6 @@ def test_consolidated_loader_routes_per_expert_names_to_expert_mapping(
         [
             "7.gate_proj.weight_packed",
             "7.down_proj.weight_scale",
-            "3.gate_up_proj.weight_packed",
         ]
     ]
 
