@@ -101,6 +101,7 @@ from vllm.models.muse_spark.common.layers import (  # noqa: F401 re-exported
     materialize_residual_path_constants,
     norm_then_gated_residual,
 )
+from vllm.models.muse_spark.common.moe import drop_gate_up_stacking
 from vllm.models.muse_spark.common.ops.fused_qk_norm_rope_kv import (
     fused_qk_norm_rope_kv_insert,
     supports_fused_kv_insert,
@@ -1518,6 +1519,8 @@ class MuseSpark1xDecoderLayer(nn.Module):
 # Runs uncompiled under breakable cudagraphs; drop LlamaModel's torch.compile.
 @ignore_torch_compile
 class MuseSpark1xModel(LlamaModel):
+    hf_to_vllm_mapper = drop_gate_up_stacking(LlamaModel.hf_to_vllm_mapper)
+
     def __init__(
         self,
         *,

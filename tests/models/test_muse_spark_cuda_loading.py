@@ -18,7 +18,10 @@ from vllm.models.muse_spark.common.moe import MuseSparkConsolidatedRoutedExperts
 from vllm.models.muse_spark.common.quant_config import (
     align_compressed_tensors_quant_config,
 )
-from vllm.models.muse_spark.nvidia.model import MuseSpark1xForCausalLM
+from vllm.models.muse_spark.nvidia.model import (
+    MuseSpark1xForCausalLM,
+    MuseSpark1xModel,
+)
 from vllm.models.muse_spark.nvidia.multimodal import MuseSparkForConditionalGeneration
 from vllm.platforms import current_platform
 
@@ -167,6 +170,33 @@ def test_cuda_mapper_keeps_per_expert_compressed_tensors_names() -> None:
         "model.layers.0.self_attn.qkv_proj.weight_scale",
     ]
     assert mapped[5][1].shard_id == "o_gate"
+
+
+def test_cuda_model_mapper_keeps_expert_gate_up_unstacked() -> None:
+    """LlamaModel's gate/up stacking must not fuse per-expert tensors.
+
+    Stacked, ``experts.7.gate_proj`` becomes ``experts.7.gate_up_proj`` and
+    RoutedExperts chunks the gate tensor in half as if it were fused.
+    """
+    experts = "layers.0.feed_forward.experts.7"
+    mapped = list(
+        MuseSpark1xModel.hf_to_vllm_mapper.apply(
+            [
+                (f"{experts}.gate_proj.weight_packed", torch.ones(1)),
+                (f"{experts}.up_proj.weight_scale", torch.ones(1)),
+                (f"{experts}.down_proj.weight_packed", torch.ones(1)),
+                ("layers.0.self_attn.q_proj.weight", torch.ones(1)),
+            ]
+        )
+    )
+    assert [name for name, _ in mapped] == [
+        f"{experts}.gate_proj.weight_packed",
+        f"{experts}.up_proj.weight_scale",
+        f"{experts}.down_proj.weight_packed",
+        "layers.0.self_attn.qkv_proj.weight",
+    ]
+    assert all(getattr(tensor, "shard_id", None) is None for _, tensor in mapped[:3])
+    assert mapped[3][1].shard_id == "q"
 
 
 def test_consolidated_loader_routes_per_expert_names_to_expert_mapping(

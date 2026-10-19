@@ -14,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+from vllm.model_executor.models.utils import WeightsMapper
 from vllm.models.muse_spark.common.ops.fused_routing import (
     fused_musespark1x_routing,
 )
@@ -143,6 +144,28 @@ def is_per_expert_weight_name(name: str) -> bool:
     return _PER_EXPERT_WEIGHT_NAME.match(name) is not None
 
 
+def drop_gate_up_stacking(base: WeightsMapper) -> WeightsMapper:
+    """Keep per-expert ``gate_proj``/``up_proj`` names unstacked.
+
+    ``LlamaModel``'s mapper stacks any ``.gate_proj``/``.up_proj`` substring
+    into ``.gate_up_proj``, which would turn a per-expert (Quark or
+    compressed-tensors) tensor into a bogus fused ``gate_up_proj`` tensor that
+    ``RoutedExperts`` then chunks in half.
+    """
+    return WeightsMapper(
+        orig_to_new_renaming=base.orig_to_new_renaming,
+        orig_to_new_regex=base.orig_to_new_regex,
+        orig_to_new_substr=base.orig_to_new_substr,
+        orig_to_new_stacked={
+            source: target
+            for source, target in base.orig_to_new_stacked.items()
+            if source not in (".gate_proj", ".up_proj")
+        },
+        orig_to_new_prefix=base.orig_to_new_prefix,
+        orig_to_new_suffix=base.orig_to_new_suffix,
+    )
+
+
 class MuseSparkConsolidatedRoutedExperts(RoutedExperts):
     """RoutedExperts that load the consolidated (all-experts-stacked) tensors.
 
@@ -227,6 +250,7 @@ __all__ = [
     "MuseSpark1xRouter",
     "MuseSparkConsolidatedRoutedExperts",
     "MuseSparkMoEConfig",
+    "drop_gate_up_stacking",
     "is_per_expert_weight_name",
     "needs_pre_norm_all_reduce",
 ]
