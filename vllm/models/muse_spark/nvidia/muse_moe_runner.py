@@ -60,9 +60,6 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     CompressedTensorsConfig,
 )
-from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import (  # noqa: E501
-    CompressedTensorsW4A4Mxfp4MoEMethod,
-)
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a8_mxfp4 import (  # noqa: E501
     CompressedTensorsW4A8Mxfp4MoEMethod,
 )
@@ -821,7 +818,6 @@ class MuseSparkCompressedTensorsMxfp4FusedMoE(CompressedTensorsW4A8Mxfp4MoEMetho
         if not moe_config.is_act_and_mul:
             raise NotImplementedError("MuseSpark MXFP4 experts require SwiGLU.")
         _validate_route_major_deployment(moe_config)
-        self.use_route_major = True
         if self.mxfp4_backend == Mxfp4MoeBackend.HUMMING:
             logger.info_once(
                 "MuseSpark MXFP4: Humming GEMMs (activation=%s) with Triton "
@@ -857,19 +853,36 @@ def _compressed_tensors_quant_method(
     quant_config: CompressedTensorsConfig,
     moe_config: FusedMoEConfig,
 ) -> FusedMoEMethodBase:
-    quant_method = quant_config.get_quant_method(layer, prefix)
-    if isinstance(quant_method, UnquantizedFusedMoEMethod):
-        return MuseSparkUnquantizedFusedMoE(moe_config)
-    if isinstance(quant_method, CompressedTensorsW4A8Mxfp4MoEMethod):
-        return MuseSparkCompressedTensorsMxfp4FusedMoE(
-            moe_config, quant_method.activation_key
+    # Lets a bare ``Linear`` target match the fused experts.
+    quant_config._add_fused_moe_to_target_scheme_map()
+    schemes = [
+        quant_config.get_scheme_dict(layer, f"{prefix}.0.{name}")
+        for name in (
+            layer.ckpt_gate_proj_name,
+            layer.ckpt_up_proj_name,
+            layer.ckpt_down_proj_name,
         )
-    if isinstance(quant_method, CompressedTensorsW4A4Mxfp4MoEMethod):
-        return MuseSparkCompressedTensorsMxfp4FusedMoE(moe_config)
-    raise NotImplementedError(
-        "MuseSpark compressed-tensors checkpoints need MXFP4 routed experts; "
-        f"got {type(quant_method).__name__} for {prefix!r}."
-    )
+    ]
+    scheme = schemes[0]
+    if any(other != scheme for other in schemes[1:]):
+        raise ValueError(
+            f"{prefix}: all MoE projections need the same quantization scheme."
+        )
+    if scheme is None:
+        return MuseSparkUnquantizedFusedMoE(moe_config)
+    weight_quant = scheme.get("weights")
+    input_quant = scheme.get("input_activations")
+    if CompressedTensorsConfig._is_mxfp4_w4a8_fp8(weight_quant, input_quant):
+        activation_key = CompressedTensorsConfig._fp8_dynamic_input_key(input_quant)
+    elif CompressedTensorsConfig._is_mxfp4(weight_quant) and input_quant is None:
+        activation_key = None
+    else:
+        raise NotImplementedError(
+            "MuseSpark compressed-tensors checkpoints need MXFP4 routed experts "
+            "with dynamic FP8 or unquantized activations; got "
+            f"{scheme} for {prefix!r}."
+        )
+    return MuseSparkCompressedTensorsMxfp4FusedMoE(moe_config, activation_key)
 
 
 class MuseSparkRoutedExperts(MuseSparkConsolidatedRoutedExperts):

@@ -12,6 +12,7 @@ from tests.kernels.moe.muse_spark_utils import (
     swiglu_moe_ref,
 )
 from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+    HummingGroupedExperts,
     HummingIndexedExperts,
 )
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import MarlinExperts
@@ -54,6 +55,13 @@ BACKENDS = [
             reason="Humming MXFP4 with block-FP8 activations needs SM90+",
         ),
         id="humming-w4a8",
+    ),
+    pytest.param(
+        "humming-grouped",
+        HummingGroupedExperts,
+        False,
+        marks=pytest.mark.skipif(not has_humming(), reason="needs Humming"),
+        id="humming-grouped-w4a16",
     ),
     pytest.param(
         "marlin",
@@ -156,10 +164,15 @@ def _dequantized_experts(checkpoint):
 def test_mxfp4_moe_runs_with_post_expert_finalize(
     dist_init,
     workspace_init,
+    monkeypatch,
     moe_backend: str,
     experts_cls: type,
     fp8_activations: bool,
 ) -> None:
+    if moe_backend == "humming-grouped":
+        # Grouped is the EP default; force it to cover the permuted-row hook.
+        monkeypatch.setenv("VLLM_HUMMING_MOE_GEMM_TYPE", "grouped")
+        moe_backend = "humming"
     norm = MuseSpark1xRMSNormWithInputScale(
         K,
         eps=1e-8,

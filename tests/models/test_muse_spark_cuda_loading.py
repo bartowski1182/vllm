@@ -285,7 +285,6 @@ def test_routed_experts_pick_hooked_mxfp4_for_compressed_tensors() -> None:
         assert method.experts_cls is HummingIndexedExperts
     else:
         assert method.experts_cls is MarlinExperts
-    assert method.use_route_major
 
 
 def test_unsupported_quantization_is_rejected() -> None:

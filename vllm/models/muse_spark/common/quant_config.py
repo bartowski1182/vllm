@@ -11,12 +11,8 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 # pass through untouched, so the HF names they embed are rewritten here.
 _HF_TO_VLLM_REGEX_REWRITES: tuple[tuple[str, str], ...] = (
     (r"mlp\.(pre|post)_expert_proj", r"feed_forward\.(pooler|unpooler)"),
-    (r"mlp\.pre_expert_proj", r"feed_forward\.pooler"),
-    (r"mlp\.post_expert_proj", r"feed_forward\.unpooler"),
     (r"mlp\.gate$", r"feed_forward\.router$"),
-    (r"mlp\.gate\.", r"feed_forward\.router\."),
     (r"mlp\.", r"feed_forward\."),
-    (r"model\.language_model\.", r"model\."),
 )
 
 
