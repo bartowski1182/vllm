@@ -36,6 +36,7 @@ from vllm.model_executor.layers.fused_moe.moe_output import (
     UnfinalizedMoEOutput,
     convert_flashinfer_moe_output,
 )
+from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
@@ -45,12 +46,22 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
 from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
     UnquantizedMoeBackend,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
 from vllm.model_executor.layers.fused_moe.utils import fi_moe_largest_bucket
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+    CompressedTensorsConfig,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4 import (  # noqa: E501
+    CompressedTensorsW4A4Mxfp4MoEMethod,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a8_mxfp4 import (  # noqa: E501
+    CompressedTensorsW4A8Mxfp4MoEMethod,
+)
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4Config,
     ModelOptNvFp4FusedMoE,
@@ -58,6 +69,7 @@ from vllm.model_executor.layers.quantization.modelopt import (
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     activation_to_flashinfer_int,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.model_executor.utils import replace_parameter
 from vllm.models.muse_spark.common.moe import (  # noqa: F401 re-exported
     MuseSpark1xRouter,
@@ -443,7 +455,7 @@ class MusePostExpertFinalize:
 
 
 def _attach_post_expert_finalize(
-    quant_method: "MuseSparkModelOptNvFp4FusedMoE | MuseSparkUnquantizedFusedMoE",
+    quant_method: "MuseSparkMoEMethod",
 ) -> None:
     """Hand the layer's finalizer to its experts, which exist only now."""
     assert quant_method.moe_kernel is not None
@@ -771,8 +783,80 @@ class MuseSparkUnquantizedFusedMoE(UnquantizedFusedMoEMethod):
         _attach_post_expert_finalize(self)
 
 
+class MuseSparkCompressedTensorsMxfp4FusedMoE(CompressedTensorsW4A8Mxfp4MoEMethod):
+    """compressed-tensors MXFP4 experts on Marlin with the post-expert norm.
+
+    Marlin is the MXFP4 kernel the oracle picks on Hopper and the only one
+    that runs ``post_gemm2_hook``. It consumes BF16 activations, so the
+    dynamic FP8 activation scheme such checkpoints declare is not applied.
+    """
+
+    muse_post_expert_finalize: MusePostExpertFinalize
+
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        activation_key: QuantKey | None = None,
+    ) -> None:
+        super().__init__(moe_config, activation_key)
+        if (
+            self.mxfp4_backend != Mxfp4MoeBackend.MARLIN
+            or self.experts_cls is not MarlinExperts
+        ):
+            raise NotImplementedError(
+                "MuseSpark compressed-tensors MXFP4 experts require the Marlin "
+                f"MoE backend, got {self.mxfp4_backend.value}; pass "
+                "--moe-backend marlin."
+            )
+        if not moe_config.is_act_and_mul:
+            raise NotImplementedError("MuseSpark Marlin requires SwiGLU.")
+        _validate_route_major_deployment(moe_config)
+        self.use_route_major = True
+        logger.info_once(
+            "MuseSpark MXFP4: Marlin W4A16 GEMMs with Triton finalization."
+        )
+        if activation_key is not None:
+            logger.warning_once(
+                "MuseSpark MXFP4 experts run Marlin with BF16 activations; the "
+                "checkpoint's %s activation quantization is not applied.",
+                activation_key,
+            )
+
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        super().process_weights_after_loading(layer)
+        _attach_post_expert_finalize(self)
+
+
+MuseSparkMoEMethod = (
+    MuseSparkModelOptNvFp4FusedMoE
+    | MuseSparkUnquantizedFusedMoE
+    | MuseSparkCompressedTensorsMxfp4FusedMoE
+)
+
+
+def _compressed_tensors_quant_method(
+    layer: RoutedExperts,
+    prefix: str,
+    quant_config: CompressedTensorsConfig,
+    moe_config: FusedMoEConfig,
+) -> FusedMoEMethodBase:
+    quant_method = quant_config.get_quant_method(layer, prefix)
+    if isinstance(quant_method, UnquantizedFusedMoEMethod):
+        return MuseSparkUnquantizedFusedMoE(moe_config)
+    if isinstance(quant_method, CompressedTensorsW4A8Mxfp4MoEMethod):
+        return MuseSparkCompressedTensorsMxfp4FusedMoE(
+            moe_config, quant_method.activation_key
+        )
+    if isinstance(quant_method, CompressedTensorsW4A4Mxfp4MoEMethod):
+        return MuseSparkCompressedTensorsMxfp4FusedMoE(moe_config)
+    raise NotImplementedError(
+        "MuseSpark compressed-tensors checkpoints need MXFP4 routed experts; "
+        f"got {type(quant_method).__name__} for {prefix!r}."
+    )
+
+
 class MuseSparkRoutedExperts(MuseSparkConsolidatedRoutedExperts):
-    """Consolidated-tensor experts with the NVFP4 / BF16 quant methods."""
+    """Consolidated-tensor experts with the NVFP4 / MXFP4 / BF16 quant methods."""
 
     def _get_quant_method(
         self,
@@ -784,6 +868,10 @@ class MuseSparkRoutedExperts(MuseSparkConsolidatedRoutedExperts):
             quant_config.is_layer_excluded(prefix)
         ):
             return MuseSparkModelOptNvFp4FusedMoE(quant_config, moe_config)
+        if isinstance(quant_config, CompressedTensorsConfig):
+            return _compressed_tensors_quant_method(
+                self, prefix, quant_config, moe_config
+            )
         # MuseSpark NVFP4 keeps layers 0 and 61 in BF16.
         return MuseSparkUnquantizedFusedMoE(moe_config)
 
@@ -808,10 +896,7 @@ class MuseMoERunner(MoERunner):
         self.post_expert_finalize = MusePostExpertFinalize(
             post_expert_norm, self.moe_config, fuse_all_reduce
         )
-        quant_method = cast(
-            MuseSparkModelOptNvFp4FusedMoE | MuseSparkUnquantizedFusedMoE,
-            routed_experts.quant_method,
-        )
+        quant_method = cast(MuseSparkMoEMethod, routed_experts.quant_method)
         quant_method.muse_post_expert_finalize = self.post_expert_finalize
 
     @property

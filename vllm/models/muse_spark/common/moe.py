@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Platform-neutral MuseSpark1x MoE pieces: routing, config, expert loading."""
 
+import re
 from collections.abc import Iterable
 
 import torch
@@ -130,13 +131,38 @@ class MuseSparkMoEConfig(FusedMoEConfig):
         return num_tokens > 0
 
 
+_PER_EXPERT_WEIGHT_NAME = re.compile(r"^\d+\.(gate_proj|up_proj|down_proj)\.")
+
+
+def is_per_expert_weight_name(name: str) -> bool:
+    """Whether a RoutedExperts-relative name addresses a single expert."""
+    return _PER_EXPERT_WEIGHT_NAME.match(name) is not None
+
+
 class MuseSparkConsolidatedRoutedExperts(RoutedExperts):
     """RoutedExperts that load the consolidated (all-experts-stacked) tensors.
 
-    Vendor subclasses supply ``_get_quant_method``.
+    Per-expert tensors (Quark and compressed-tensors exports) take the generic
+    ``RoutedExperts`` path. Vendor subclasses supply ``_get_quant_method``.
     """
 
     def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[str]:
+        consolidated: list[tuple[str, torch.Tensor]] = []
+        per_expert: list[tuple[str, torch.Tensor]] = []
+        for name, tensor in weights:
+            if not is_per_expert_weight_name(name):
+                consolidated.append((name, tensor))
+            elif not name.endswith(".weight_shape"):
+                # compressed-tensors metadata with no vLLM parameter.
+                per_expert.append((name, tensor))
+        if consolidated:
+            yield from self._load_consolidated_weights(consolidated)
+        if per_expert:
+            yield from super().load_weights(per_expert)
+
+    def _load_consolidated_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[str]:
         for name, tensor in weights:
@@ -197,5 +223,6 @@ __all__ = [
     "MuseSpark1xRouter",
     "MuseSparkConsolidatedRoutedExperts",
     "MuseSparkMoEConfig",
+    "is_per_expert_weight_name",
     "needs_pre_norm_all_reduce",
 ]
