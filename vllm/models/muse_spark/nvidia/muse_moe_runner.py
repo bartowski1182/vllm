@@ -19,6 +19,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     nvfp4_moe_quant_config,
 )
+from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+    HummingGroupedExperts,
+    HummingIndexedExperts,
+)
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import MarlinExperts
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
 from vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe import (
@@ -783,12 +787,19 @@ class MuseSparkUnquantizedFusedMoE(UnquantizedFusedMoEMethod):
         _attach_post_expert_finalize(self)
 
 
-class MuseSparkCompressedTensorsMxfp4FusedMoE(CompressedTensorsW4A8Mxfp4MoEMethod):
-    """compressed-tensors MXFP4 experts on Marlin with the post-expert norm.
+# MXFP4 experts kernels that stop after GEMM2 and run ``post_gemm2_hook``.
+_MXFP4_HOOKED_EXPERTS: dict[Mxfp4MoeBackend, tuple[type, ...]] = {
+    Mxfp4MoeBackend.HUMMING: (HummingIndexedExperts, HummingGroupedExperts),
+    Mxfp4MoeBackend.MARLIN: (MarlinExperts,),
+}
 
-    Marlin is the MXFP4 kernel the oracle picks on Hopper and the only one
-    that runs ``post_gemm2_hook``. It consumes BF16 activations, so the
-    dynamic FP8 activation scheme such checkpoints declare is not applied.
+
+class MuseSparkCompressedTensorsMxfp4FusedMoE(CompressedTensorsW4A8Mxfp4MoEMethod):
+    """compressed-tensors MXFP4 experts with the post-expert norm.
+
+    Humming (the Hopper default) applies the checkpoint's activation scheme,
+    e.g. W4A8 with block-FP8 activations. Marlin is W4A16: it consumes BF16
+    activations, so the declared activation quantization is not applied.
     """
 
     muse_post_expert_finalize: MusePostExpertFinalize
@@ -799,19 +810,25 @@ class MuseSparkCompressedTensorsMxfp4FusedMoE(CompressedTensorsW4A8Mxfp4MoEMetho
         activation_key: QuantKey | None = None,
     ) -> None:
         super().__init__(moe_config, activation_key)
-        if (
-            self.mxfp4_backend != Mxfp4MoeBackend.MARLIN
-            or self.experts_cls is not MarlinExperts
-        ):
+        hooked_experts = _MXFP4_HOOKED_EXPERTS.get(self.mxfp4_backend, ())
+        if self.experts_cls not in hooked_experts:
             raise NotImplementedError(
-                "MuseSpark compressed-tensors MXFP4 experts require the Marlin "
-                f"MoE backend, got {self.mxfp4_backend.value}; pass "
+                "MuseSpark compressed-tensors MXFP4 experts need a backend that "
+                "runs post_gemm2_hook (Humming or Marlin), got "
+                f"{self.mxfp4_backend.value}; pass --moe-backend humming or "
                 "--moe-backend marlin."
             )
         if not moe_config.is_act_and_mul:
-            raise NotImplementedError("MuseSpark Marlin requires SwiGLU.")
+            raise NotImplementedError("MuseSpark MXFP4 experts require SwiGLU.")
         _validate_route_major_deployment(moe_config)
         self.use_route_major = True
+        if self.mxfp4_backend == Mxfp4MoeBackend.HUMMING:
+            logger.info_once(
+                "MuseSpark MXFP4: Humming GEMMs (activation=%s) with Triton "
+                "finalization.",
+                activation_key,
+            )
+            return
         logger.info_once(
             "MuseSpark MXFP4: Marlin W4A16 GEMMs with Triton finalization."
         )

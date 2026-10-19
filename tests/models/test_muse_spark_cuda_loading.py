@@ -221,15 +221,21 @@ def test_qkv_o_gate_loader_slices_block_scales_by_scale_rows(dist_init) -> None:
         layer.weight_loader(scale, full_k_scale, "k")
 
 
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="Marlin needs CUDA")
-def test_routed_experts_pick_marlin_mxfp4_for_compressed_tensors() -> None:
-    """The user-facing dispatch lands on the Marlin method with the finalize."""
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="needs CUDA")
+def test_routed_experts_pick_hooked_mxfp4_for_compressed_tensors() -> None:
+    """The dispatch lands on an MXFP4 kernel that runs the post-expert finalize:
+    Humming where it outranks Marlin (Hopper), Marlin elsewhere."""
     from tests.kernels.moe.test_muse_spark_moe_deployment import _moe_config
+    from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+        HummingIndexedExperts,
+    )
     from vllm.model_executor.layers.fused_moe.experts.marlin_moe import MarlinExperts
+    from vllm.model_executor.layers.quantization.utils.humming import prefers_humming
     from vllm.models.muse_spark.nvidia.muse_moe_runner import (
         MuseSparkCompressedTensorsMxfp4FusedMoE,
         MuseSparkRoutedExperts,
     )
+    from vllm.utils.import_utils import has_humming
 
     config = _aligned_quant_config()
     moe_config = _moe_config()
@@ -242,7 +248,10 @@ def test_routed_experts_pick_marlin_mxfp4_for_compressed_tensors() -> None:
             "model.layers.3.feed_forward.experts", config, moe_config
         )
     assert isinstance(method, MuseSparkCompressedTensorsMxfp4FusedMoE)
-    assert method.experts_cls is MarlinExperts
+    if has_humming() and prefers_humming():
+        assert method.experts_cls is HummingIndexedExperts
+    else:
+        assert method.experts_cls is MarlinExperts
     assert method.use_route_major
 
 

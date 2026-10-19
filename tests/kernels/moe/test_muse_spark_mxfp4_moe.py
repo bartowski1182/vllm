@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Marlin coverage for MuseSpark's compressed-tensors MXFP4 experts."""
+"""Humming and Marlin coverage for MuseSpark's compressed-tensors MXFP4 experts."""
 
 import pytest
 import torch
@@ -10,6 +10,9 @@ from tests.kernels.moe.muse_spark_utils import (
     make_runner,
     run_moe,
     swiglu_moe_ref,
+)
+from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+    HummingIndexedExperts,
 )
 from vllm.model_executor.layers.fused_moe.experts.marlin_moe import MarlinExperts
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
@@ -26,30 +29,67 @@ from vllm.models.muse_spark.nvidia.muse_moe_runner import (
     MuseSparkCompressedTensorsMxfp4FusedMoE,
 )
 from vllm.platforms import current_platform
+from vllm.utils.import_utils import has_humming
 
-if not (current_platform.is_cuda() and is_fp4_marlin_supported()):
-    pytest.skip("Requires a CUDA GPU with Marlin", allow_module_level=True)
+if not current_platform.is_cuda():
+    pytest.skip("Requires a CUDA GPU", allow_module_level=True)
+
+# (moe_backend, experts class, checkpoint declares FP8 activations). Humming
+# applies the block-FP8 activation scheme, which it only offers on SM90+;
+# Marlin is W4A16 and ignores the declared activations.
+BACKENDS = [
+    pytest.param(
+        "humming",
+        HummingIndexedExperts,
+        False,
+        marks=pytest.mark.skipif(not has_humming(), reason="needs Humming"),
+        id="humming-w4a16",
+    ),
+    pytest.param(
+        "humming",
+        HummingIndexedExperts,
+        True,
+        marks=pytest.mark.skipif(
+            not (has_humming() and current_platform.has_device_capability(90)),
+            reason="Humming MXFP4 with block-FP8 activations needs SM90+",
+        ),
+        id="humming-w4a8",
+    ),
+    pytest.param(
+        "marlin",
+        MarlinExperts,
+        True,
+        marks=pytest.mark.skipif(
+            not is_fp4_marlin_supported(), reason="needs FP4 Marlin"
+        ),
+        id="marlin-w4a16",
+    ),
+]
 
 E, N, K, TOPK, M = 8, 256, 512, 2, 8
 GROUP = 32
 PROJECTIONS = (("gate_proj", N, K), ("up_proj", N, K), ("down_proj", K, N))
 
 
-def _quant_config() -> CompressedTensorsConfig:
-    """MXFP4 experts with dynamic FP8 group activations, as llm-compressor emits."""
+def _quant_config(fp8_activations: bool) -> CompressedTensorsConfig:
+    """MXFP4 experts, optionally with the dynamic FP8 group activations
+    llm-compressor emits."""
+    input_activations = None
+    if fp8_activations:
+        input_activations = {
+            "dynamic": True,
+            "group_size": 128,
+            "num_bits": 8,
+            "strategy": "group",
+            "symmetric": True,
+            "type": "float",
+        }
     return CompressedTensorsConfig.from_config(
         {
             "config_groups": {
                 "experts": {
                     "format": "mxfp4-pack-quantized",
-                    "input_activations": {
-                        "dynamic": True,
-                        "group_size": 128,
-                        "num_bits": 8,
-                        "strategy": "group",
-                        "symmetric": True,
-                        "type": "float",
-                    },
+                    "input_activations": input_activations,
                     "targets": [r"re:.*experts\.\d+\.(gate|up|down)_proj$"],
                     "weights": {
                         "dynamic": False,
@@ -111,8 +151,15 @@ def _dequantized_experts(checkpoint):
     return w13, w2
 
 
+@pytest.mark.parametrize(("moe_backend", "experts_cls", "fp8_activations"), BACKENDS)
 @torch.inference_mode()
-def test_marlin_mxfp4_moe_runs_with_triton_finalize(dist_init, workspace_init) -> None:
+def test_mxfp4_moe_runs_with_post_expert_finalize(
+    dist_init,
+    workspace_init,
+    moe_backend: str,
+    experts_cls: type,
+    fp8_activations: bool,
+) -> None:
     norm = MuseSpark1xRMSNormWithInputScale(
         K,
         eps=1e-8,
@@ -127,14 +174,15 @@ def test_marlin_mxfp4_moe_runs_with_triton_finalize(dist_init, workspace_init) -
         norm,
         expert_bias,
         checkpoint,
-        _quant_config(),
+        _quant_config(fp8_activations),
         hidden_size=K,
         intermediate_size=N,
         top_k=TOPK,
+        moe_backend=moe_backend,
     )
     quant_method = runner.routed_experts.quant_method
     assert isinstance(quant_method, MuseSparkCompressedTensorsMxfp4FusedMoE)
-    assert type(quant_method.moe_kernel.fused_experts) is MarlinExperts
+    assert type(quant_method.moe_kernel.fused_experts) is experts_cls
 
     hidden_states = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") / 10
     router_logits = torch.randn(M, E, dtype=torch.float32, device="cuda")
