@@ -38,17 +38,25 @@ def dequant_mxfp4(packed: torch.Tensor, scale: torch.Tensor, group: int = 32):
     return (vals.view(n, k // group, group) * scales[:, :, None]).view(n, k)
 
 
+def find_keys(weight_map: dict, pattern: str) -> list[str]:
+    keys = [k for k in weight_map if re.search(pattern, k)]
+    if not keys:
+        sample = sorted(k for k in weight_map if ".experts." in k)[:5]
+        raise SystemExit(
+            f"no tensors matching /{pattern}/ in index; sample expert keys: {sample}"
+        )
+    return keys
+
+
 def load_quantized_expert(ckpt_dir: str, layer: int, expert: int, proj: str):
     index = json.load(open(os.path.join(ckpt_dir, "model.safetensors.index.json")))
-    prefix = f"model.layers.{layer}.mlp.experts.{expert}.{proj}."
-    keys = [k for k in index["weight_map"] if k.startswith(prefix)]
-    if not keys:
-        raise SystemExit(f"no tensors with prefix {prefix!r} in checkpoint index")
+    pattern = rf"\.layers\.{layer}\.mlp\.experts\.{expert}\.{proj}\.(\w+)$"
     tensors = {}
-    for key in keys:
+    for key in find_keys(index["weight_map"], pattern):
         with safe_open(os.path.join(ckpt_dir, index["weight_map"][key]), "pt") as f:
-            tensors[key[len(prefix):]] = f.get_tensor(key)
-    print(f"{prefix}*: " + ", ".join(f"{k}{tuple(v.shape)}/{v.dtype}" for k, v in tensors.items()))
+            tensors[re.search(pattern, key).group(1)] = f.get_tensor(key)
+    print(f"{key.rsplit('.', 1)[0]}.*: " + ", ".join(
+        f"{k}{tuple(v.shape)}/{v.dtype}" for k, v in tensors.items()))
     return dequant_mxfp4(tensors["weight_packed"], tensors["weight_scale"])
 
 
@@ -63,7 +71,9 @@ def open_original(original: str, filename: str):
 def load_original_expert(original: str, layer: int, expert: int, proj: str):
     with open_original(original, "model.safetensors.index.json") as f:
         index = json.load(f)
-    key = f"model.layers.{layer}.mlp.experts.{proj}"
+    (key,) = find_keys(
+        index["weight_map"], rf"\.layers\.{layer}\.mlp\.experts\.{proj}(\.weight)?$"
+    )
     shard = index["weight_map"][key]
     with open_original(original, shard) as f:
         (hdr_len,) = struct.unpack("<Q", f.read(8))
