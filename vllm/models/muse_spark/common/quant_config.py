@@ -20,11 +20,19 @@ _HF_TO_VLLM_REGEX_REWRITES: tuple[tuple[str, str], ...] = (
 )
 
 
+# RoutedExperts resolves its scheme by probing ``experts.0.gate_proj`` /
+# ``up_proj`` / ``down_proj``; a recipe written against fused per-expert
+# ``gate_up_proj`` modules must match those probes as well.
+_SPLIT_GATE_UP = "(?:gate_up_proj|gate_proj|up_proj)"
+
+
 def _rewrite_regex_target(target: str) -> str:
     if not target.startswith("re:"):
         return target
     for hf_name, vllm_name in _HF_TO_VLLM_REGEX_REWRITES:
         target = target.replace(hf_name, vllm_name)
+    if "experts" in target and _SPLIT_GATE_UP not in target:
+        target = target.replace("gate_up_proj", _SPLIT_GATE_UP)
     return target
 
 

@@ -128,6 +128,25 @@ def _mxfp4_checkpoint() -> dict[str, torch.Tensor]:
     return checkpoint
 
 
+def _fuse_gate_up(checkpoint: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Rewrite ``e.gate_proj`` / ``e.up_proj`` into ``e.gate_up_proj`` ([2I, ...],
+    gate rows first), the layout llm-compressor's fused per-expert export uses."""
+    fused = {}
+    for expert in range(E):
+        for suffix in ("weight_packed", "weight_scale"):
+            fused[f"{expert}.gate_up_proj.{suffix}"] = torch.cat(
+                [
+                    checkpoint[f"{expert}.gate_proj.{suffix}"],
+                    checkpoint[f"{expert}.up_proj.{suffix}"],
+                ]
+            )
+        for suffix in ("weight_packed", "weight_scale"):
+            fused[f"{expert}.down_proj.{suffix}"] = checkpoint[
+                f"{expert}.down_proj.{suffix}"
+            ]
+    return fused
+
+
 def _dequant(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     values = break_fp4_bytes(packed, torch.float32).view(*scale.shape, GROUP)
     values = values * torch.exp2(scale.float() - 127)[..., None]
@@ -211,3 +230,30 @@ def test_mxfp4_moe_runs_with_post_expert_finalize(
         torch.randn_like(hidden_states),
         torch.randn_like(router_logits),
     )
+
+
+@torch.inference_mode()
+def test_fused_gate_up_checkpoint_matches_split(dist_init, workspace_init) -> None:
+    """Per-expert ``gate_up_proj`` tensors load into the same experts as
+    ``gate_proj`` + ``up_proj``."""
+    norm = MuseSpark1xRMSNormWithInputScale(
+        K, eps=1e-8, has_weight=False, is_post_norm=True, zero_centered_gamma=True
+    ).cuda()
+    expert_bias = torch.zeros(E, dtype=torch.float32, device="cuda")
+    checkpoint = _mxfp4_checkpoint()
+    hidden_states = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") / 10
+    router_logits = torch.randn(M, E, dtype=torch.float32, device="cuda")
+
+    outputs = []
+    for ckpt in (checkpoint, _fuse_gate_up(checkpoint)):
+        _, runner, vllm_config = make_runner(
+            norm,
+            expert_bias,
+            ckpt,
+            _quant_config(fp8_activations=False),
+            hidden_size=K,
+            intermediate_size=N,
+            top_k=TOPK,
+        )
+        outputs.append(run_moe(runner, vllm_config, hidden_states, router_logits))
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)

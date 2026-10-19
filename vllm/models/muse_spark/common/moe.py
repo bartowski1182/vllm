@@ -131,7 +131,11 @@ class MuseSparkMoEConfig(FusedMoEConfig):
         return num_tokens > 0
 
 
-_PER_EXPERT_WEIGHT_NAME = re.compile(r"^\d+\.(gate_proj|up_proj|down_proj)\.")
+# llm-compressor exports split (gate_proj/up_proj) or fused (gate_up_proj)
+# per-expert tensors depending on its version; RoutedExperts loads both.
+_PER_EXPERT_WEIGHT_NAME = re.compile(
+    r"^\d+\.(gate_up_proj|gate_proj|up_proj|down_proj)\."
+)
 
 
 def is_per_expert_weight_name(name: str) -> bool:
